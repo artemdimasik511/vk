@@ -59,11 +59,12 @@ GEMINI_PROXY = (
     or DEFAULT_PROXY
 )
 
-if GEMINI_PROXY:
-    os.environ.setdefault("HTTP_PROXY", GEMINI_PROXY)
-    os.environ.setdefault("HTTPS_PROXY", GEMINI_PROXY)
-    os.environ.setdefault("http_proxy", GEMINI_PROXY)
-    os.environ.setdefault("https_proxy", GEMINI_PROXY)
+# Защита от перехвата трафика VK API и ЮKassa сторонними прокси
+# GEMINI_PROXY передается точечно только в запросы Gemini API (gemini_service.py)
+for var in ("NO_PROXY", "no_proxy"):
+    current = os.environ.get(var, "")
+    bypass = "api.vk.com,vk.com,oauth.vk.com,api.yookassa.ru,yookassa.ru,127.0.0.1,localhost"
+    os.environ[var] = f"{current},{bypass}" if current else bypass
 
 GEMINI_RELAY_URL = os.getenv(
     "GEMINI_RELAY_URL",

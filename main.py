@@ -160,6 +160,9 @@ class VKStudentBot:
         
         logger.info("Инициализация соединения с VK API...")
         self.vk_session = vk_api.VkApi(token=self.token)
+        # Отключаем использование системных и прокси-переменных окружения для прямых запросов к VK API
+        if hasattr(self.vk_session, "http") and hasattr(self.vk_session.http, "trust_env"):
+            self.vk_session.http.trust_env = False
         self.vk = self.vk_session.get_api()
         
         # Автоматическое определение group_id, если не задан в .env
