@@ -1,0 +1,33 @@
+# Локальные переменные окружения и секреты
+.env
+.env.local
+.env.*.local
+
+# Байткод Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Логи
+*.log
+bot.log
+
+# Локальные базы данных (чтобы не повреждать базу при переключении коммитов)
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+
+# Офлайн-модели речи Vosk (тяжелые бинарники)
+models/
+
+# Временные файлы ОС и редакторов
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
