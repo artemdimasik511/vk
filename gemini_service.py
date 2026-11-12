@@ -296,19 +296,33 @@ def normalize_text_tokens(text: str) -> set:
 
 
 def match_subject_similarity(target_subj: str, lesson_subj: str) -> float:
-    """Вычисляет сходство названий предметов по подстрокам и пересечению основ слов."""
+    """Вычисляет сходство названий предметов по подстрокам, rapidfuzz и пересечению основ слов."""
     t_clean = target_subj.lower().strip()
     l_clean = lesson_subj.lower().strip()
     if not t_clean or not l_clean:
         return 0.0
     if t_clean in l_clean or l_clean in t_clean:
         return 1.0
+
+    try:
+        from rapidfuzz import fuzz
+        # Нечеткое сопоставление с устойчивостью к падежам, опечаткам и лишним словам
+        ts_ratio = fuzz.token_set_ratio(t_clean, l_clean) / 100.0
+        p_ratio = fuzz.partial_ratio(t_clean, l_clean) / 100.0
+        max_fuzz = max(ts_ratio, p_ratio)
+        if max_fuzz >= 0.55:
+            return max_fuzz
+    except ImportError:
+        pass
+
     t_tokens = normalize_text_tokens(target_subj)
     l_tokens = normalize_text_tokens(lesson_subj)
     if not t_tokens or not l_tokens:
         return 0.0
     common = t_tokens.intersection(l_tokens)
-    return len(common) / len(t_tokens)
+    if common:
+        return len(common) / min(len(t_tokens), len(l_tokens))
+    return 0.0
 
 
 def match_teacher(target_teach: str, lesson_teach: str) -> bool:
@@ -446,9 +460,10 @@ def calculate_next_practice_date(
 
 def recognize_schedule_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> List[Dict[str, Any]]:
     """
-    Распознает расписание занятий по фотографии с помощью Gemini API.
-    Включает SHA-256 кэширование (0 токенов при повторной отправке того же фото)
-    и сжатый JSON-промпт для ускорения ответа и защиты от HTTP 503.
+    Распознает расписание занятий по фотографии:
+    1. Сначала пробует Gemini API (если прокси доступен)
+    2. При ошибке — автоматически переключается на локальный Tesseract OCR
+    Включает SHA-256 кэширование (0 токенов при повторной отправке того же фото).
     """
     img_hash = f"sched_{hashlib.sha256(image_bytes).hexdigest()}"
     if img_hash in _media_cache:
@@ -466,6 +481,7 @@ def recognize_schedule_image(image_bytes: bytes, mime_type: str = "image/jpeg") 
 - "lesson_type": (пр)/(сем)/практика -> "PRACTICE", (л)/лекция -> "LECTURE", по умолчанию -> "PRACTICE"
 Верни ТОЛЬКО валидный JSON-массив."""
 
+    # Попытка 1: Gemini API (через прокси)
     try:
         raw_text = generate_content_with_fallback(
             prompt_text=prompt,
@@ -487,8 +503,11 @@ def recognize_schedule_image(image_bytes: bytes, mime_type: str = "image/jpeg") 
         return lessons
     except Exception as e:
         err_msg = str(e)
+        logger.warning(f"Gemini недоступен для распознавания расписания: {e}")
+        
+        # Попытка через реле-шлюз
         if "User location is not supported" in err_msg or "400" in err_msg:
-            logger.info("⚡ Обнаружено региональное ограничение Google Gemini (User location is not supported). Переключение на облачный европейский шлюз...")
+            logger.info("⚡ Переключение на облачный европейский шлюз...")
             try:
                 b64_img = base64.b64encode(image_bytes).decode("utf-8")
                 relay_res = call_relay_api("recognize-schedule", {
@@ -496,13 +515,26 @@ def recognize_schedule_image(image_bytes: bytes, mime_type: str = "image/jpeg") 
                     "mimeType": mime_type
                 })
                 if relay_res and "lessons" in relay_res:
-                    logger.info(f"✅ Расписание успешно распознано через реле-шлюз! Найдено пар: {len(relay_res['lessons'])}")
+                    logger.info(f"✅ Расписание распознано через реле-шлюз! Пар: {len(relay_res['lessons'])}")
                     _media_cache[img_hash] = relay_res["lessons"]
                     return relay_res["lessons"]
             except Exception as relay_err:
-                logger.error(f"Ошибка при вызове реле-шлюза: {relay_err}")
-                
-        logger.error(f"Ошибка при распознавании расписания через Gemini: {e}")
+                logger.warning(f"Реле-шлюз также недоступен: {relay_err}")
+
+        # Попытка 2: Локальный Tesseract OCR (полностью офлайн)
+        logger.info("🔄 Переключение на локальное OCR-распознавание (Tesseract)...")
+        try:
+            from local_ocr import recognize_schedule_local
+            lessons = recognize_schedule_local(image_bytes, mime_type)
+            if lessons:
+                logger.info(f"✅ Расписание распознано ЛОКАЛЬНО через Tesseract OCR! Пар: {len(lessons)}")
+                _media_cache[img_hash] = lessons
+                return lessons
+        except ImportError:
+            logger.error("Модуль local_ocr.py не найден.")
+        except Exception as ocr_err:
+            logger.error(f"Локальное OCR также не удалось: {ocr_err}")
+
         raise RuntimeError(f"Не удалось распознать расписание: {e}")
 
 
@@ -1100,11 +1132,23 @@ def process_voice_homework(
     if (not transcript_text or not transcript_text.strip()) and audio_bytes:
         try:
             from voice_recognizer import transcribe_audio_locally
-            offline_text = transcribe_audio_locally(audio_bytes)
+            offline_text = transcribe_audio_locally(audio_bytes, user_schedule=user_schedule)
             if offline_text:
                 transcript_text = offline_text
         except Exception as vosk_err:
             logger.debug(f"Локальное распознавание голоса пропущено: {vosk_err}")
+
+    # Шаг 0.5: NLP-коррекция готовой расшифровки (от ВК или текстового ввода) с учётом расписания
+    if transcript_text and transcript_text.strip() and user_schedule:
+        try:
+            from local_nlp import correct_transcript
+            corrected = correct_transcript(transcript_text, user_schedule)
+            if corrected:
+                transcript_text = corrected
+        except ImportError:
+            pass
+        except Exception as nlp_err:
+            logger.debug(f"NLP-коррекция пропущена: {nlp_err}")
 
     # Шаг 1: Если есть текстовая расшифровка (от ВК, Vosk или текстового ввода) — пробуем Zero-Token локальный парсер
     if transcript_text and transcript_text.strip():
@@ -1192,8 +1236,11 @@ def process_voice_homework(
         return result
     except Exception as e:
         err_msg = str(e)
-        if "User location is not supported" in err_msg or "400" in err_msg:
-            logger.info("⚡ Обнаружено региональное ограничение Google Gemini (User location is not supported). Переключение на облачный европейский шлюз...")
+        logger.warning(f"Ошибка вызова Gemini API ({e}). Пробуем резервные каналы...")
+
+        # 1. Резервный облачный европейский шлюз (работает из РФ без собственного прокси)
+        if GEMINI_RELAY_URL:
+            logger.info("⚡ Переключение на европейский облачный реле-шлюз...")
             try:
                 payload_data: Dict[str, Any] = {"vk_id": 1001}
                 if transcript_text and transcript_text.strip():
@@ -1206,7 +1253,20 @@ def process_voice_homework(
                     logger.info("✅ Задание успешно обработано через реле-шлюз!")
                     return relay_res["result"]
             except Exception as relay_err:
-                logger.error(f"Ошибка при вызове реле-шлюза для аудио: {relay_err}")
+                logger.warning(f"Реле-шлюз также недоступен: {relay_err}")
+
+        # 2. Локальный резерв: если есть текст (из Vosk или от ВК), парсим локально через Zero-Token + Fuzzy NLP
+        if transcript_text and transcript_text.strip():
+            logger.info("⚡ Попытка локального парсинга задания без участия внешних нейросетей...")
+            try:
+                from local_nlp import correct_transcript
+                corr = correct_transcript(transcript_text, user_schedule or [])
+                loc = parse_homework_locally(corr or transcript_text, user_schedule or [], today_date=today_date)
+                if loc:
+                    logger.info("✅ Задание успешно спасено и распознано локальным парсером!")
+                    return loc
+            except Exception as loc_err:
+                logger.debug(f"Локальный парсинг не удался: {loc_err}")
 
         logger.error(f"Ошибка при обработке голосового сообщения: {e}")
         raise RuntimeError(f"Не удалось распознать голосовое сообщение: {e}")

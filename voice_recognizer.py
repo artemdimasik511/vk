@@ -113,11 +113,12 @@ def convert_audio_to_pcm_wav(audio_bytes: bytes) -> Optional[bytes]:
     return None
 
 
-def transcribe_audio_locally(audio_bytes: bytes) -> Optional[str]:
+def transcribe_audio_locally(audio_bytes: bytes, user_schedule: list = None) -> Optional[str]:
     """
     Распознает голосовое сообщение полностью локально на процессоре (0 токенов Gemini):
     1. Через офлайн-движок Vosk (vosk-model-small-ru-0.22).
     2. Если Vosk недоступен — пробует SpeechRecognition.
+    3. После распознавания применяет нечёткую коррекцию (local_nlp) с учётом расписания студента.
     Возвращает распознанный текст или None.
     """
     if not audio_bytes:
@@ -148,6 +149,20 @@ def transcribe_audio_locally(audio_bytes: bytes) -> Optional[str]:
                     full_text = " ".join(parts).strip()
                     if full_text:
                         logger.info(f"🎙️ [Vosk Offline] Голосовое распознано локально (0 токенов): «{full_text}»")
+                        
+                        # Применяем нечёткую коррекцию через local_nlp (исправляем ошибки Vosk)
+                        if user_schedule:
+                            try:
+                                from local_nlp import correct_transcript
+                                corrected = correct_transcript(full_text, user_schedule)
+                                if corrected and corrected != full_text:
+                                    logger.info(f"🔧 [NLP] Текст после коррекции: «{corrected}»")
+                                    full_text = corrected
+                            except ImportError:
+                                pass
+                            except Exception as nlp_err:
+                                logger.debug(f"NLP-коррекция пропущена: {nlp_err}")
+                        
                         return full_text
             except Exception as e:
                 logger.warning(f"Ошибка при локальном распознавании Vosk: {e}")

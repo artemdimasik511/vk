@@ -5,3 +5,5 @@ python-dotenv>=1.0.0
 Pillow>=10.0.0
 vosk>=0.3.45
 soundfile>=0.12.1
+rapidfuzz>=3.0.0
+pytesseract>=0.3.10
