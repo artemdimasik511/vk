@@ -19,7 +19,8 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
-MODELS_DIR = BASE_DIR / "models"
+# Храним модель в стандартной системной папке без кириллицы (защита от багов C++ библиотеки Kaldi в Windows)
+MODELS_DIR = Path.home() / ".cache" / "vosk"
 VOSK_MODEL_NAME = "vosk-model-small-ru-0.22"
 VOSK_MODEL_PATH = MODELS_DIR / VOSK_MODEL_NAME
 VOSK_MODEL_URL = f"https://alphacephei.com/vosk/models/{VOSK_MODEL_NAME}.zip"
@@ -113,11 +114,12 @@ def convert_audio_to_pcm_wav(audio_bytes: bytes) -> Optional[bytes]:
     return None
 
 
-def transcribe_audio_locally(audio_bytes: bytes) -> Optional[str]:
+def transcribe_audio_locally(audio_bytes: bytes, user_schedule: list = None) -> Optional[str]:
     """
     Распознает голосовое сообщение полностью локально на процессоре (0 токенов Gemini):
     1. Через офлайн-движок Vosk (vosk-model-small-ru-0.22).
     2. Если Vosk недоступен — пробует SpeechRecognition.
+    3. После распознавания применяет нечёткую коррекцию (local_nlp) с учётом расписания студента.
     Возвращает распознанный текст или None.
     """
     if not audio_bytes:
@@ -148,6 +150,20 @@ def transcribe_audio_locally(audio_bytes: bytes) -> Optional[str]:
                     full_text = " ".join(parts).strip()
                     if full_text:
                         logger.info(f"🎙️ [Vosk Offline] Голосовое распознано локально (0 токенов): «{full_text}»")
+                        
+                        # Применяем нечёткую коррекцию через local_nlp (исправляем ошибки Vosk)
+                        if user_schedule:
+                            try:
+                                from local_nlp import correct_transcript
+                                corrected = correct_transcript(full_text, user_schedule)
+                                if corrected and corrected != full_text:
+                                    logger.info(f"🔧 [NLP] Текст после коррекции: «{corrected}»")
+                                    full_text = corrected
+                            except ImportError:
+                                pass
+                            except Exception as nlp_err:
+                                logger.debug(f"NLP-коррекция пропущена: {nlp_err}")
+                        
                         return full_text
             except Exception as e:
                 logger.warning(f"Ошибка при локальном распознавании Vosk: {e}")

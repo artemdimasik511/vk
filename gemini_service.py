@@ -296,19 +296,33 @@ def normalize_text_tokens(text: str) -> set:
 
 
 def match_subject_similarity(target_subj: str, lesson_subj: str) -> float:
-    """Вычисляет сходство названий предметов по подстрокам и пересечению основ слов."""
+    """Вычисляет сходство названий предметов по подстрокам, rapidfuzz и пересечению основ слов."""
     t_clean = target_subj.lower().strip()
     l_clean = lesson_subj.lower().strip()
     if not t_clean or not l_clean:
         return 0.0
     if t_clean in l_clean or l_clean in t_clean:
         return 1.0
+
+    try:
+        from rapidfuzz import fuzz
+        # Нечеткое сопоставление с устойчивостью к падежам, опечаткам и лишним словам
+        ts_ratio = fuzz.token_set_ratio(t_clean, l_clean) / 100.0
+        p_ratio = fuzz.partial_ratio(t_clean, l_clean) / 100.0
+        max_fuzz = max(ts_ratio, p_ratio)
+        if max_fuzz >= 0.55:
+            return max_fuzz
+    except ImportError:
+        pass
+
     t_tokens = normalize_text_tokens(target_subj)
     l_tokens = normalize_text_tokens(lesson_subj)
     if not t_tokens or not l_tokens:
         return 0.0
     common = t_tokens.intersection(l_tokens)
-    return len(common) / len(t_tokens)
+    if common:
+        return len(common) / min(len(t_tokens), len(l_tokens))
+    return 0.0
 
 
 def match_teacher(target_teach: str, lesson_teach: str) -> bool:
@@ -446,9 +460,10 @@ def calculate_next_practice_date(
 
 def recognize_schedule_image(image_bytes: bytes, mime_type: str = "image/jpeg") -> List[Dict[str, Any]]:
     """
-    Распознает расписание занятий по фотографии с помощью Gemini API.
-    Включает SHA-256 кэширование (0 токенов при повторной отправке того же фото)
-    и сжатый JSON-промпт для ускорения ответа и защиты от HTTP 503.
+    Распознает расписание занятий по фотографии:
+    1. Сначала пробует Gemini API (если прокси доступен)
+    2. При ошибке — автоматически переключается на локальный Tesseract OCR
+    Включает SHA-256 кэширование (0 токенов при повторной отправке того же фото).
     """
     img_hash = f"sched_{hashlib.sha256(image_bytes).hexdigest()}"
     if img_hash in _media_cache:
@@ -466,6 +481,7 @@ def recognize_schedule_image(image_bytes: bytes, mime_type: str = "image/jpeg") 
 - "lesson_type": (пр)/(сем)/практика -> "PRACTICE", (л)/лекция -> "LECTURE", по умолчанию -> "PRACTICE"
 Верни ТОЛЬКО валидный JSON-массив."""
 
+    # Попытка 1: Gemini API (через прокси)
     try:
         raw_text = generate_content_with_fallback(
             prompt_text=prompt,
@@ -487,8 +503,11 @@ def recognize_schedule_image(image_bytes: bytes, mime_type: str = "image/jpeg") 
         return lessons
     except Exception as e:
         err_msg = str(e)
+        logger.warning(f"Gemini недоступен для распознавания расписания: {e}")
+        
+        # Попытка через реле-шлюз
         if "User location is not supported" in err_msg or "400" in err_msg:
-            logger.info("⚡ Обнаружено региональное ограничение Google Gemini (User location is not supported). Переключение на облачный европейский шлюз...")
+            logger.info("⚡ Переключение на облачный европейский шлюз...")
             try:
                 b64_img = base64.b64encode(image_bytes).decode("utf-8")
                 relay_res = call_relay_api("recognize-schedule", {
@@ -496,13 +515,26 @@ def recognize_schedule_image(image_bytes: bytes, mime_type: str = "image/jpeg") 
                     "mimeType": mime_type
                 })
                 if relay_res and "lessons" in relay_res:
-                    logger.info(f"✅ Расписание успешно распознано через реле-шлюз! Найдено пар: {len(relay_res['lessons'])}")
+                    logger.info(f"✅ Расписание распознано через реле-шлюз! Пар: {len(relay_res['lessons'])}")
                     _media_cache[img_hash] = relay_res["lessons"]
                     return relay_res["lessons"]
             except Exception as relay_err:
-                logger.error(f"Ошибка при вызове реле-шлюза: {relay_err}")
-                
-        logger.error(f"Ошибка при распознавании расписания через Gemini: {e}")
+                logger.warning(f"Реле-шлюз также недоступен: {relay_err}")
+
+        # Попытка 2: Локальный Tesseract OCR (полностью офлайн)
+        logger.info("🔄 Переключение на локальное OCR-распознавание (Tesseract)...")
+        try:
+            from local_ocr import recognize_schedule_local
+            lessons = recognize_schedule_local(image_bytes, mime_type)
+            if lessons:
+                logger.info(f"✅ Расписание распознано ЛОКАЛЬНО через Tesseract OCR! Пар: {len(lessons)}")
+                _media_cache[img_hash] = lessons
+                return lessons
+        except ImportError:
+            logger.error("Модуль local_ocr.py не найден.")
+        except Exception as ocr_err:
+            logger.error(f"Локальное OCR также не удалось: {ocr_err}")
+
         raise RuntimeError(f"Не удалось распознать расписание: {e}")
 
 
@@ -557,19 +589,24 @@ def split_into_homework_segments(text: str, user_schedule: List[Dict[str, Any]])
     raw_lines = re.split(r'[\n;]+', text.strip())
     preliminary_chunks: List[str] = []
 
+    # Расширенный регулярный разделитель: поддерживает дз, д.з., д. з., дэзэ, домашка, а также разделители перед ФИО
+    dz_split_regex = (
+        r'(?=(?:^|\s|[.,!])(?:\d+[.)]\s*)?(?:(?:а\s+также|и\s+еще|а\s+еще|дальше|второе|третье|четвертое|а|и)\s+)?'
+        r'(?:домашнее\s+задание|домашняя\s+работа|домашка|д\s*\.\s*з\s*\.?|дз|дэзэ|дэ\s+зэ|де\s+зе)(?:\s*[:\-—.]|\s+|$))|'
+        r'(?<=[.,!?])\s+(?=(?:(?:а|и)\s+)?(?:у\s+)?[А-ЯЁ][а-яё]{2,20}\s*[-—:])'
+    )
+
     for line in raw_lines:
         line_clean = re.sub(r'^\s*[\-•*]+\s*', '', line.strip())
         if not line_clean:
             continue
-        # Разбиваем, если внутри одной строки несколько раз встречается "ДЗ <текст>" или "1) ДЗ ..." / "2. ДЗ ..."
-        parts = re.split(
-            r'(?=(?:^|\s|[.,!])(?:\d+[.)]\s*)?(?:а\s+также\s+|и\s+еще\s+|дальше\s+|второе\s+)?(?:домашнее\s+задание|домашка|дз)\b)',
-            line_clean,
-            flags=re.IGNORECASE
-        )
+        parts = re.split(dz_split_regex, line_clean, flags=re.IGNORECASE)
         for p in parts:
-            p_str = p.strip(' .,;-•*')
-            if len(p_str) >= 5:
+            if not p:
+                continue
+            # Убираем хвостовые союзы ' и', ' а', ' также'
+            p_str = re.sub(r'\s+(?:и|а|также|еще|дальше)\s*$', '', p.strip(), flags=re.IGNORECASE).strip(' .,;-•*')
+            if len(p_str) >= 4:
                 preliminary_chunks.append(p_str)
 
     if not preliminary_chunks:
@@ -652,16 +689,16 @@ TASK_ACTION_STARTERS = {
 def _strip_subject_and_teacher_prefix(task_body: str, subject: str, teacher: str) -> str:
     """
     Аккуратно очищает начало текста задания от:
-    - маркера 'ДЗ' / 'Домашнее задание'
+    - маркера 'ДЗ' / 'Домашнее задание' (включая 'д.з.', 'д. з.', 'дэзэ')
     - Фамилии и инициалов преподавателя
-    - Названия предмета (как до двоеточия/тире, так и без разделителей: 'ДЗ Костин Учебная практика собрать аккумулятор')
+    - Названия предмета (как до двоеточия/тире, так и без разделителей)
     Возвращает чистый текст самого задания.
     """
     body = task_body.strip()
 
-    # 1. Убираем маркер ДЗ и возможную нумерацию в начале
+    # 1. Убираем маркер ДЗ и возможную нумерацию в начале (с точками, пробелами и падежами)
     body = re.sub(
-        r'^\s*(?:\d+[.)]\s*)?(?:а\s+|и\s+|также\s+|еще\s+)*(?:запиши\s+)?(?:домашнее\s+задание|домашка|дз|задание)\b\s*[:\-—]?\s*',
+        r'^\s*(?:\d+[.)]\s*)?(?:а\s+|и\s+|также\s+|еще\s+)*(?:запиши\s+)?(?:домашнее\s+задание|домашняя\s+работа|домашка|д\s*\.\s*з\s*\.?|дз|дэзэ|дэ\s+зэ|де\s+зе)(?:\s*[:\-—.]|\s+|$)\s*',
         '',
         body,
         flags=re.IGNORECASE
@@ -750,6 +787,7 @@ def _strip_subject_and_teacher_prefix(task_body: str, subject: str, teacher: str
     if consume_idx > 0 and consume_idx < len(tokens):
         body = " ".join(tokens[consume_idx:])
 
+    body = re.sub(r'\s+(?:и|а|также|еще|дальше)\s*$', '', body, flags=re.IGNORECASE)
     return body.strip(' ,.-:;!—')
 
 
@@ -761,23 +799,27 @@ def _parse_fallback_explicit_dz_command(
     today_date: date
 ) -> Optional[Dict[str, Any]]:
     """
-    Резервный парсер для явной текстовой команды 'ДЗ <Преподаватель> <Предмет> <Задание>',
-    когда названный преподаватель или предмет еще не занесен в расписание студента.
+    Резервный парсер для явной команды или сегмента ДЗ, когда названный преподаватель
+    или предмет еще не занесен в расписание (например: 'д.з. Агафонова - воскреснуть' или 'Агафонова - воскреснуть').
     """
-    if not re.match(
-        r'^\s*(?:\d+[.)]\s*)?(?:а\s+|и\s+|также\s+|еще\s+)*(?:запиши\s+)?(?:домашнее\s+задание|домашка|дз)\b',
-        text_clean,
-        flags=re.IGNORECASE
-    ):
-        return None
+    body = text_clean.strip()
 
-    # Убираем "ДЗ" в начале и фразы дат
+    # Убираем "ДЗ" в начале
     body = re.sub(
-        r'^\s*(?:\d+[.)]\s*)?(?:а\s+|и\s+|также\s+|еще\s+)*(?:запиши\s+)?(?:домашнее\s+задание|домашка|дз)\b\s*[:\-—]?\s*',
+        r'^\s*(?:\d+[.)]\s*)?(?:а\s+|и\s+|также\s+|еще\s+)*(?:запиши\s+)?(?:домашнее\s+задание|домашняя\s+работа|домашка|д\s*\.\s*з\s*\.?|дз|дэзэ|дэ\s+зэ|де\s+зе)(?:\s*[:\-—.]|\s+|$)\s*',
         '',
-        text_clean,
+        body,
         flags=re.IGNORECASE
     ).strip()
+
+    # Проверяем, есть ли маркер ДЗ или разделитель ':' или '-' / '—'
+    has_dz_marker = bool(re.search(r'(?:домашнее\s+задание|домашняя\s+работа|домашка|д\s*\.\s*з\s*\.?|дз|дэзэ)', text_clean, flags=re.IGNORECASE))
+    has_separator = bool(re.search(r'[:\-—]', body))
+    if not has_dz_marker and not has_separator:
+        # Проверяем формат "Фамилия Задание" (например: "Агафонова воскреснуть")
+        tokens_check = body.split()
+        if len(tokens_check) < 2 or not tokens_check[0][0].isupper():
+            return None
 
     date_cleanup_patterns = [
         r'(?:с\s+открытой\s+датой|без\s+дедлайна|без\s+срока|бессрочно)',
@@ -794,15 +836,15 @@ def _parse_fallback_explicit_dz_command(
         body = re.sub(pat, ' ', body, flags=re.IGNORECASE)
     body = re.sub(r'\s+', ' ', body).strip(' ,.-:;!')
 
-    if len(body) < 5:
+    if len(body) < 3:
         return None
 
     teacher = "Не указан"
     subject = "Общее задание"
     task_part = ""
 
-    # Вариант А: Есть разделитель ':' или ' - ' / ' — ' ("Костин Учебная практика: собрать аккумулятор")
-    m_sep = re.match(r'^([^:]{2,80}?)\s*(?::|\s+[-—]\s+)\s*(.{3,})$', body)
+    # Вариант А: Есть разделитель ':' или ' - ' / ' — ' ("Агафонова - воскреснуть" или "Костин Учебная практика: собрать аккумулятор")
+    m_sep = re.match(r'^([^:]{2,80}?)\s*(?::|\s+[-—]\s+)\s*(.{2,})$', body)
     if m_sep:
         header = m_sep.group(1).strip(' ,.-')
         task_part = m_sep.group(2).strip(' ,.-')
@@ -810,7 +852,6 @@ def _parse_fallback_explicit_dz_command(
         if len(h_tokens) == 1:
             teacher = h_tokens[0].capitalize()
         elif len(h_tokens) >= 2:
-            # Проверяем инициалы после фамилии (например: "Костин А.К. Учебная практика")
             if re.match(r'^[А-ЯЁA-Z]\.(?:[А-ЯЁA-Z]\.)?$', h_tokens[1], flags=re.IGNORECASE):
                 teacher = f"{h_tokens[0].capitalize()} {h_tokens[1].upper()}"
                 subj_tokens = h_tokens[2:]
@@ -822,9 +863,9 @@ def _parse_fallback_explicit_dz_command(
                 if subj_str:
                     subject = subj_str[0].upper() + subj_str[1:]
     else:
-        # Вариант Б: Без двоеточия ("ДЗ Смирнов Философия написать эссе по Канту")
+        # Вариант Б: Без разделителя ("Агафонова воскреснуть" или "Смирнов Философия написать эссе")
         tokens = body.split()
-        if len(tokens) < 3:
+        if len(tokens) < 2:
             return None
         teacher = tokens[0].strip(' ,.:').capitalize()
         idx = 1
@@ -850,8 +891,9 @@ def _parse_fallback_explicit_dz_command(
         else:
             task_part = " ".join(tokens[1:])
 
-    task_part = re.sub(r'^\s*(?:нужно|надо|задал[аи]?)\s+', '', task_part, flags=re.IGNORECASE).strip(' ,.-:;!')
-    if len(task_part) < 3:
+    task_part = re.sub(r'^\s*(?:нужно|надо|задал[аи]?)\s+', '', task_part, flags=re.IGNORECASE)
+    task_part = re.sub(r'\s+(?:и|а|также|еще|дальше)\s*$', '', task_part, flags=re.IGNORECASE).strip(' ,.-:;!')
+    if len(task_part) < 2:
         return None
 
     task_text = task_part[0].upper() + task_part[1:]
@@ -1100,11 +1142,23 @@ def process_voice_homework(
     if (not transcript_text or not transcript_text.strip()) and audio_bytes:
         try:
             from voice_recognizer import transcribe_audio_locally
-            offline_text = transcribe_audio_locally(audio_bytes)
+            offline_text = transcribe_audio_locally(audio_bytes, user_schedule=user_schedule)
             if offline_text:
                 transcript_text = offline_text
         except Exception as vosk_err:
             logger.debug(f"Локальное распознавание голоса пропущено: {vosk_err}")
+
+    # Шаг 0.5: NLP-коррекция готовой расшифровки (от ВК или текстового ввода) с учётом расписания
+    if transcript_text and transcript_text.strip() and user_schedule:
+        try:
+            from local_nlp import correct_transcript
+            corrected = correct_transcript(transcript_text, user_schedule)
+            if corrected:
+                transcript_text = corrected
+        except ImportError:
+            pass
+        except Exception as nlp_err:
+            logger.debug(f"NLP-коррекция пропущена: {nlp_err}")
 
     # Шаг 1: Если есть текстовая расшифровка (от ВК, Vosk или текстового ввода) — пробуем Zero-Token локальный парсер
     if transcript_text and transcript_text.strip():
@@ -1192,8 +1246,11 @@ def process_voice_homework(
         return result
     except Exception as e:
         err_msg = str(e)
-        if "User location is not supported" in err_msg or "400" in err_msg:
-            logger.info("⚡ Обнаружено региональное ограничение Google Gemini (User location is not supported). Переключение на облачный европейский шлюз...")
+        logger.warning(f"Ошибка вызова Gemini API ({e}). Пробуем резервные каналы...")
+
+        # 1. Резервный облачный европейский шлюз (работает из РФ без собственного прокси)
+        if GEMINI_RELAY_URL:
+            logger.info("⚡ Переключение на европейский облачный реле-шлюз...")
             try:
                 payload_data: Dict[str, Any] = {"vk_id": 1001}
                 if transcript_text and transcript_text.strip():
@@ -1206,7 +1263,20 @@ def process_voice_homework(
                     logger.info("✅ Задание успешно обработано через реле-шлюз!")
                     return relay_res["result"]
             except Exception as relay_err:
-                logger.error(f"Ошибка при вызове реле-шлюза для аудио: {relay_err}")
+                logger.warning(f"Реле-шлюз также недоступен: {relay_err}")
+
+        # 2. Локальный резерв: если есть текст (из Vosk или от ВК), парсим локально через Zero-Token + Fuzzy NLP
+        if transcript_text and transcript_text.strip():
+            logger.info("⚡ Попытка локального парсинга задания без участия внешних нейросетей...")
+            try:
+                from local_nlp import correct_transcript
+                corr = correct_transcript(transcript_text, user_schedule or [])
+                loc = parse_homework_locally(corr or transcript_text, user_schedule or [], today_date=today_date)
+                if loc:
+                    logger.info("✅ Задание успешно спасено и распознано локальным парсером!")
+                    return loc
+            except Exception as loc_err:
+                logger.debug(f"Локальный парсинг не удался: {loc_err}")
 
         logger.error(f"Ошибка при обработке голосового сообщения: {e}")
         raise RuntimeError(f"Не удалось распознать голосовое сообщение: {e}")
